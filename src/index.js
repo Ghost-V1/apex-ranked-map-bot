@@ -130,10 +130,10 @@ client.on('interactionCreate', async (interaction) => {
         .setColor(mapColor(current.code))
         .addFields(
           { name: '🗺️ Map', value: `**${current.map}**`, inline: true },
-          { name: '⏱️ Until', value: formatTime(current.end), inline: true },
+          { name: '⏱️ Ends', value: formatCountdown(current.end), inline: true },
           { name: '\u200B', value: '\u200B', inline: true },
           { name: '⏭️ Next Map', value: next?.map || 'Unknown', inline: true },
-          { name: '🕐 Starts', value: formatTime(next?.start), inline: true },
+          { name: '🕐 Starts', value: formatCountdown(next?.start), inline: true },
           { name: '\u200B', value: '\u200B', inline: true },
         )
         .setFooter({ text: 'Data from apexlegendsstatus.com' })

@@ -45,8 +45,9 @@ async function fetchMapRotation() {
 
   // ── Current map ─────────────────────────────────────────────────
   // After "BR Ranked</h2>", there's a <div class="container brranked">
-  // containing <h2>MapName</h2> and <h5> with data-tz spans.
-  // Narrow extraction to the current map's container (before curmap-next-maps).
+  // containing <h2>MapName</h2>, <h5> with data-tz spans, and a timer div.
+  // The timer div's data-start/data-end are the CORRECT UTC timestamps.
+  // The data-tz spans are adjusted for the viewer's timezone — avoid them.
   const nextMapsStart = rankedSection.indexOf('curmap-next-maps');
   const currentBlock = nextMapsStart > 0
     ? rankedSection.slice(0, nextMapsStart)
@@ -55,12 +56,38 @@ async function fetchMapRotation() {
   const currentH2Match = currentBlock.match(/<h2[^>]*>([^<]+)<\/h2>/);
   const currentMap = currentH2Match ? currentH2Match[1].trim() : null;
 
-  // Extract timestamps only from the current map's container
-  const tzMatches = currentBlock.match(/data-tz="(\d+)"/g);
-  const timestamps = tzMatches
-    ? tzMatches.map(m => parseInt(m.match(/\d+/)[0]))
-    : [];
-  const currentEnd = timestamps.length >= 2 ? timestamps[1] : null;
+  // Extract timestamps from the timer div (most reliable UTC source).
+  // Use two separate regexes — attribute order is not guaranteed in HTML.
+  const startMatch = currentBlock.match(/data-start="(\d+)"/);
+  const endMatch   = currentBlock.match(/data-end="(\d+)"/);
+  let currentStart = null;
+  let currentEnd = null;
+  let tzOffset = 0; // seconds to add to data-tz values to get real UTC
+
+  if (startMatch && endMatch) {
+    currentStart = parseInt(startMatch[1]);
+    currentEnd   = parseInt(endMatch[1]);
+
+    // Compute timezone offset by comparing timer (correct UTC) vs data-tz spans.
+    // This lets us fix upcoming map timestamps which only have data-tz.
+    const tzMatches = currentBlock.match(/data-tz="(\d+)"/g);
+    const tzTimestamps = tzMatches
+      ? tzMatches.map(m => parseInt(m.match(/\d+/)[0]))
+      : [];
+    if (tzTimestamps.length >= 2) {
+      tzOffset = currentEnd - tzTimestamps[1];
+    }
+  } else {
+    // Fallback: use data-tz spans (less reliable — may be timezone-shifted)
+    const tzMatches = currentBlock.match(/data-tz="(\d+)"/g);
+    const timestamps = tzMatches
+      ? tzMatches.map(m => parseInt(m.match(/\d+/)[0]))
+      : [];
+    if (timestamps.length >= 2) {
+      currentStart = timestamps[0];
+      currentEnd   = timestamps[1];
+    }
+  }
 
   // ── Upcoming maps ───────────────────────────────────────────────
   // Isolate the ranked "curmap-next-maps" block (stop before Mixtape/Wildcard heading).
@@ -83,8 +110,9 @@ async function fetchMapRotation() {
     const tzs = block.match(/data-tz="(\d+)"/g);
     if (nameMatch && tzs && tzs.length >= 2) {
       const name = nameMatch[1].trim();
-      const start = parseInt(tzs[0].match(/\d+/)[0]);
-      const end   = parseInt(tzs[1].match(/\d+/)[0]);
+      // Apply timezone offset to correct data-tz shift (same offset as current map)
+      const start = parseInt(tzs[0].match(/\d+/)[0]) + tzOffset;
+      const end   = parseInt(tzs[1].match(/\d+/)[0]) + tzOffset;
       upcoming.push({
         map: name,
         code: NAME_TO_CODE[name] || null,
@@ -99,9 +127,10 @@ async function fetchMapRotation() {
   return {
     ranked: {
       current: {
-        map:  currentMap,
-        code: NAME_TO_CODE[currentMap] || null,
-        end:  currentEnd,
+        map:   currentMap,
+        code:  NAME_TO_CODE[currentMap] || null,
+        start: currentStart,
+        end:   currentEnd,
         readableDate: null,
       },
       next: firstNext ? {
@@ -126,9 +155,10 @@ async function getCurrentRankedMap() {
   return {
     currentMap:       ranked.current?.map ?? null,
     currentCode:      ranked.current?.code ?? null,
+    currentStart:     ranked.current?.start ?? null,
+    currentEnd:       ranked.current?.end ?? null,
     nextMap:          ranked.next?.map ?? null,
     nextCode:         ranked.next?.code ?? null,
-    currentEnd:       ranked.current?.end ?? null,
     nextStart:        ranked.next?.start ?? null,
     nextEnd:          ranked.next?.end ?? null,
     currentReadableDate: ranked.current?.readableDate ?? null,
