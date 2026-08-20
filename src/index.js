@@ -31,7 +31,9 @@ client.on('reconnecting', () => console.warn('🔄 Discord gateway reconnecting.
 
 let lastKnownMapCode = null; // tracks the previously-seen ranked map code
 let lastKnownMapName = null; // tracks the previously-seen ranked map display name
+let lastLoginError = null;   // last Discord login error message, surfaced via health endpoint
 let pollTimer = null;
+const processStart = Date.now();
 
 // ── Map Emoji & Color Helpers ────────────────────────────────────────
 const MAP_EMOJI = {
@@ -201,8 +203,22 @@ client.once('clientReady', () => {
 // Try PORT env var first, fall back to a random available port if needed
 const PORT = process.env.PORT || 0;
 const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end(`🟢 Apex Ranked Map Bot — Online\nCurrent map: ${lastKnownMapName || 'loading...'}`);
+  const ready = client.isReady();
+  const body =
+    `🟢 Apex Ranked Map Bot\n` +
+    `Discord connected: ${ready ? 'YES ✅' : 'NO ❌'}\n` +
+    `Current map: ${lastKnownMapName || 'loading...'}\n` +
+    (lastLoginError ? `Last login error: ${lastLoginError}\n` : '');
+  // Grace period of 45s after boot: during startup the bot is briefly not
+  // connected yet, so don't fail the health check until it's had time to log in.
+  const stillStarting = Date.now() - processStart < 45_000;
+  if (ready || stillStarting) {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+  } else {
+    // Fail Render's health check loudly instead of reporting "live" while dead
+    res.writeHead(503, { 'Content-Type': 'text/plain' });
+  }
+  res.end(body);
 });
 server.on('error', (err) => {
   console.error('🌐 Health server error:', err.message);
@@ -229,8 +245,11 @@ process.on('SIGTERM', () => {
 
 // ── Start ────────────────────────────────────────────────────────────
 client.login(process.env.DISCORD_TOKEN).catch((err) => {
+  lastLoginError = err.message;
   console.error('❌ Discord login FAILED:', err.message);
   console.error('   This usually means DISCORD_TOKEN is wrong, expired, or has extra whitespace.');
   console.error('   Fix it in Render → Environment → DISCORD_TOKEN, then redeploy.');
-  process.exit(1); // fail the deploy loudly instead of running a dead bot
+  // Stay alive briefly so the health endpoint reports WHY (Discord connected: NO
+  // + last login error), then exit so Render's restart loop retries automatically.
+  setTimeout(() => process.exit(1), 45_000);
 });
