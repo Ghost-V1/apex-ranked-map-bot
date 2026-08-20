@@ -21,6 +21,14 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
+// ── Discord Connection Visibility ────────────────────────────────────
+// Without these handlers, login/connection failures are silent: the health
+// server keeps running so Render reports "live", but the bot never connects.
+client.on('error', (err) => console.error('⚠️ Discord client error:', err.message));
+client.on('shardError', (err) => console.error('⚠️ Discord shard error:', err.message));
+client.on('disconnect', () => console.warn('🔌 Discord gateway disconnected'));
+client.on('reconnecting', () => console.warn('🔄 Discord gateway reconnecting...'));
+
 let lastKnownMapCode = null; // tracks the previously-seen ranked map code
 let lastKnownMapName = null; // tracks the previously-seen ranked map display name
 let pollTimer = null;
@@ -220,4 +228,9 @@ process.on('SIGTERM', () => {
 });
 
 // ── Start ────────────────────────────────────────────────────────────
-client.login(process.env.DISCORD_TOKEN);
+client.login(process.env.DISCORD_TOKEN).catch((err) => {
+  console.error('❌ Discord login FAILED:', err.message);
+  console.error('   This usually means DISCORD_TOKEN is wrong, expired, or has extra whitespace.');
+  console.error('   Fix it in Render → Environment → DISCORD_TOKEN, then redeploy.');
+  process.exit(1); // fail the deploy loudly instead of running a dead bot
+});
