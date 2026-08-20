@@ -18,6 +18,21 @@ const NAME_TO_CODE = {
 };
 
 /**
+ * Resolve a stable internal code for a map name.
+ * Unknown/new maps fall back to a slugified name (e.g. "New Map" → "new_map")
+ * so we never return null — emoji/color lookups already fall back gracefully.
+ * @param {string|null} name
+ * @returns {string|null}
+ */
+function toMapCode(name) {
+  if (!name) return null;
+  return NAME_TO_CODE[name] || name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+/**
  * Fetch and parse the ranked map rotation from the public website.
  * @returns {Promise<object>} Contains `ranked` key with current/next/upcoming data.
  */
@@ -115,7 +130,7 @@ async function fetchMapRotation() {
       const end   = parseInt(tzs[1].match(/\d+/)[0]) + tzOffset;
       upcoming.push({
         map: name,
-        code: NAME_TO_CODE[name] || null,
+        code: toMapCode(name),
         start,
         end,
       });
@@ -128,7 +143,7 @@ async function fetchMapRotation() {
     ranked: {
       current: {
         map:   currentMap,
-        code:  NAME_TO_CODE[currentMap] || null,
+        code:  toMapCode(currentMap),
         start: currentStart,
         end:   currentEnd,
         readableDate: null,

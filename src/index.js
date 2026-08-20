@@ -76,8 +76,11 @@ async function checkAndAlert() {
 
     if (!currentMap) return; // nothing to report
 
-    // First run — just store, don't alert
-    if (lastKnownMapCode === null) {
+    // First run — just store, don't alert.
+    // Track by the raw map NAME, not the mapped code. The name is always a
+    // non-null string when we get here, so this sentinel can't collide with a
+    // missing/unrecognized value and silently stop the bot from alerting.
+    if (lastKnownMapName === null) {
       lastKnownMapCode = currentCode;
       lastKnownMapName = currentMap;
       console.log(`📍 Initial map: ${currentMap} (${currentCode})`);
@@ -85,7 +88,7 @@ async function checkAndAlert() {
     }
 
     // Map changed!
-    if (currentCode !== lastKnownMapCode) {
+    if (currentMap !== lastKnownMapName) {
       const embed = new EmbedBuilder()
         .setTitle(`${mapEmoji(currentCode)} Ranked Map Changed!`)
         .setDescription(
