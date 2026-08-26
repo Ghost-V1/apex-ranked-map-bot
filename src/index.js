@@ -245,6 +245,43 @@ setInterval(async () => {
   }
 }, 60_000);
 
+// ── Free-Tier Keep-Alive ────────────────────────────────────────────
+// Render free web services spin down after ~15 min with no INBOUND traffic.
+// The bot's Discord connection is outbound (doesn't count) and self-pings don't
+// reliably count either — the guaranteed fix is an EXTERNAL uptime monitor
+// (e.g. UptimeRobot) hitting the health URL every ~5 min. This self-ping is a
+// best-effort supplement that keeps the instance awake where self-requests do
+// register. RENDER_EXTERNAL_URL is provided automatically by Render.
+const KEEPALIVE_URL = process.env.RENDER_EXTERNAL_URL || null;
+const KEEPALIVE_INTERVAL_MS = 5 * 60_000;
+
+async function keepAlivePing() {
+  if (!KEEPALIVE_URL) return;
+  const t0 = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const res = await fetch(KEEPALIVE_URL, {
+      signal: controller.signal,
+      headers: { 'User-Agent': 'ApexRankedMapBot/1.0 (keep-alive)' },
+    });
+    console.log(`🔄 Keep-alive ping: ${res.status} (${Date.now() - t0}ms)`);
+  } catch (err) {
+    console.warn(`🔄 Keep-alive ping failed: ${err.message}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+if (KEEPALIVE_URL) {
+  console.log(`🔄 Keep-alive enabled — self-pinging ${KEEPALIVE_URL} every 5 min`);
+  setInterval(keepAlivePing, KEEPALIVE_INTERVAL_MS);
+} else {
+  console.warn('⚠️ RENDER_EXTERNAL_URL not set — free-tier instance may spin down.');
+  console.warn('   Set up an external uptime monitor (UptimeRobot) on the bot URL');
+  console.warn('   to ping it every ~5 min and prevent spin-down.');
+}
+
 // ── HTTP Server (for Render health checks & UptimeRobot keep-alive) ──
 // Try PORT env var first, fall back to a random available port if needed
 const PORT = process.env.PORT || 0;
