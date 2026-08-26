@@ -28,6 +28,13 @@ client.on('error', (err) => console.error('⚠️ Discord client error:', err.me
 client.on('shardError', (err) => console.error('⚠️ Discord shard error:', err.message));
 client.on('disconnect', () => console.warn('🔌 Discord gateway disconnected'));
 client.on('reconnecting', () => console.warn('🔄 Discord gateway reconnecting...'));
+client.on('resume', () => {
+  // Session resumed cleanly (or we freshly connected) — make sure polling is
+  // running so map-change alerts fire. Guards the case where the gateway
+  // dropped without firing 'clientReady' again. Idempotent and safe.
+  ensurePolling();
+  console.warn('🔌 Discord gateway session resumed — polling resumed');
+});
 
 let lastKnownMapCode = null; // tracks the previously-seen ranked map code
 let lastKnownMapName = null; // tracks the previously-seen ranked map display name
@@ -192,6 +199,16 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 // ── Lifecycle ────────────────────────────────────────────────────────
+// Start the polling loop that watches for map rotations and alerts the channel.
+// Idempotent — safe to call after a reconnect or session resume.
+function ensurePolling() {
+  if (pollTimer) return; // already running
+  pollTimer = setInterval(checkAndAlert, POLL_INTERVAL_MS);
+  // Immediate first check so an already-rotated map is caught right away.
+  checkAndAlert();
+  console.log(`⏱️  Polling every ${POLL_INTERVAL_MS / 60_000} minutes`);
+}
+
 // .on() (not .once()) so a re-login after a connection failure still re-runs setup.
 client.on('clientReady', () => {
   loginAttempt = 0; // successful login — reset the backoff counter
@@ -199,19 +216,14 @@ client.on('clientReady', () => {
     clearTimeout(loginWatchdog);
     loginWatchdog = null;
   }
-  if (pollTimer) {
+  if (client.isReady() && !pollTimer) {
+    console.log(`✅ Logged in as ${client.user.tag}`);
+    console.log(`📍 Alert channel: ${process.env.CHANNEL_ID}`);
+    ensurePolling();
+  } else if (pollTimer) {
     // Already set up from a previous successful login — this is a reconnect.
     console.log(`✅ Reconnected as ${client.user.tag}`);
-    return;
   }
-  console.log(`✅ Logged in as ${client.user.tag}`);
-  console.log(`📍 Alert channel: ${process.env.CHANNEL_ID}`);
-  console.log(`⏱️  Polling every ${POLL_INTERVAL_MS / 60_000} minutes`);
-
-  // Immediate first check
-  checkAndAlert();
-  // Set up recurring polling
-  pollTimer = setInterval(checkAndAlert, POLL_INTERVAL_MS);
 });
 
 // ── Discord Reachability Probe ───────────────────────────────────────
@@ -357,6 +369,7 @@ process.on('SIGTERM', () => {
 const LOGIN_TIMEOUT_MS = 45_000; // how long to wait for one login attempt
 const RETRY_MIN_MS     = 15_000; // first retry delay
 const RETRY_MAX_MS     = 5 * 60_000; // backoff cap: never retry faster than every 5 min
+const RECONNECT_WATCH_MS = 60_000; // how often we verify the gateway is still up
 
 // Exponential backoff: 15s, 30s, 60s, 120s, 240s, 480s→capped at 5 min.
 // Rapid retries trigger Discord's rate limiter (HTTP 429); backing off lets the
@@ -364,6 +377,52 @@ const RETRY_MAX_MS     = 5 * 60_000; // backoff cap: never retry faster than eve
 function nextRetryDelay(attempt) {
   return Math.min(RETRY_MIN_MS * 2 ** Math.min(attempt - 1, 5), RETRY_MAX_MS);
 }
+
+// ── Reconnect Watchdog ──────────────────────────────────────────────
+// The retry loop only runs until the FIRST successful login. If the gateway
+// drops AFTER that (Render's unstable free-tier IPs, a missed heartbeat, a
+// silent disconnect), nothing re-runs attemptLogin() and the process becomes an
+// orphan: Render says "live" (HTTP 200), but Discord shows the bot offline and
+// slash commands + rotation alerts stop working. This watchdog checks every
+// minute: if the client isn't ready but Discord's API is reachable, we tear
+// down the gateway and force a fresh login (which re-arms the poll loop via
+// clientReady). It's the difference between the bot being merely "running" and
+// actually connected.
+let reconnectWatch = null;
+
+function startReconnectWatch() {
+  if (reconnectWatch) return;
+  reconnectWatch = setInterval(() => {
+    if (client.isReady()) return; // all good
+    if (loginWatchdog) return;    // a login attempt is currently in flight
+    if (retryTimer) return;       // a retry is already scheduled — stand aside
+    // Only force a reconnect if the network to Discord is actually fine —
+    // otherwise we're just hammering into an outage / rate limit.
+    const reachable = lastEgressCheck?.ok && (Date.now() - lastEgressCheck.at < 120_000);
+    if (!reachable) return;
+    console.error('🩺 Watchdog: Discord connected = NO but API reachable — forcing reconnect...');
+    // Deliberately KEEP lastKnownMapName so the first poll after reconnect
+    // compares the live map vs the pre-outage map and alerts if a rotation
+    // actually happened while we were down — otherwise that rotation is lost
+    // forever (the exact alert the user is missing). Only a brand-new process
+    // (lastKnownMapName === null) re-baselines silently.
+    const wasConnected = lastKnownMapName !== null;
+    client.destroy().catch(() => {});
+    lastLoginError = null;
+    loginAttempt = 0;
+    // Give discord.js a beat to fully tear down the old gateway before we
+    // open a fresh login — calling login() back-to-back with destroy() can
+    // race and leave the client in an inconsistent, never-ready state.
+    setTimeout(() => {
+      attemptLogin().catch((e) => console.error('🩺 Reconnect attempt failed:', e.message));
+    }, 2000);
+    if (wasConnected) {
+      console.warn('🩺 Will alert on next poll if the map rotated while offline.');
+    }
+  }, RECONNECT_WATCH_MS);
+}
+
+startReconnectWatch();
 
 // Retry login in-process instead of crashing the container: Render keeps the
 // service running and healthy (200), the bot backs off exponentially, and the
