@@ -33,6 +33,7 @@ let lastKnownMapCode = null; // tracks the previously-seen ranked map code
 let lastKnownMapName = null; // tracks the previously-seen ranked map display name
 let lastLoginError = null;   // last Discord login error message, surfaced via health endpoint
 let pollTimer = null;
+let loginWatchdog = null;    // 60s timer: kills a hanging login so Render restarts us
 const processStart = Date.now();
 
 // ── Map Emoji & Color Helpers ────────────────────────────────────────
@@ -189,6 +190,7 @@ client.on('interactionCreate', async (interaction) => {
 
 // ── Lifecycle ────────────────────────────────────────────────────────
 client.once('clientReady', () => {
+  clearTimeout(loginWatchdog);
   console.log(`✅ Logged in as ${client.user.tag}`);
   console.log(`📍 Alert channel: ${process.env.CHANNEL_ID}`);
   console.log(`⏱️  Polling every ${POLL_INTERVAL_MS / 60_000} minutes`);
@@ -244,7 +246,18 @@ process.on('SIGTERM', () => {
 });
 
 // ── Start ────────────────────────────────────────────────────────────
+// Watchdog: if login neither succeeds nor fails within 60s (e.g. Discord's
+// gateway is unreachable from Render), fail loudly and let Render restart us.
+// Without this, a hanging login sits at 503 forever with no log line and no retry.
+loginWatchdog = setTimeout(() => {
+  console.error('⏰ Discord login is hanging (no response after 60s).');
+  console.error('   This usually means the bot cannot reach Discord from Render.');
+  console.error('   Exiting so Render restarts us — will retry automatically.');
+  process.exit(1);
+}, 60_000);
+
 client.login(process.env.DISCORD_TOKEN).catch((err) => {
+  clearTimeout(loginWatchdog);
   lastLoginError = err.message;
   console.error('❌ Discord login FAILED:', err.message);
   console.error('   This usually means DISCORD_TOKEN is wrong, expired, or has extra whitespace.');
