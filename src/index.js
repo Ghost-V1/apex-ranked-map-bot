@@ -194,6 +194,7 @@ client.on('interactionCreate', async (interaction) => {
 // ── Lifecycle ────────────────────────────────────────────────────────
 // .on() (not .once()) so a re-login after a connection failure still re-runs setup.
 client.on('clientReady', () => {
+  loginAttempt = 0; // successful login — reset the backoff counter
   if (loginWatchdog) {
     clearTimeout(loginWatchdog);
     loginWatchdog = null;
@@ -214,23 +215,43 @@ client.on('clientReady', () => {
 });
 
 // ── Discord Reachability Probe ───────────────────────────────────────
-// Separately pings Discord's REST API so we can tell whether the instance can
-// reach Discord at all — independent of the gateway (ws) connection.
+// Pings Discord's REST API with the bot token so we can distinguish:
+//   200  → Discord reachable AND token valid
+//   401  → token invalid/revoked (fix in Render env)
+//   429  → Discord rate-limiting this IP (back off and wait)
+//   error → network-level unreachability
 async function probeDiscordEgress() {
   const t0 = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
-    const res = await fetch('https://discord.com/api/v10/gateway', {
+    const res = await fetch('https://discord.com/api/v10/users/@me', {
       signal: controller.signal,
-      headers: { 'User-Agent': 'ApexRankedMapBot/1.0' },
+      headers: {
+        'User-Agent': 'ApexRankedMapBot/1.0',
+        'Authorization': `Bot ${process.env.DISCORD_TOKEN}`,
+      },
     });
-    clearTimeout(timer);
-    lastEgressCheck = res.ok
-      ? { at: Date.now(), ok: true, ms: Date.now() - t0, error: null }
-      : { at: Date.now(), ok: false, ms: Date.now() - t0, error: `HTTP ${res.status}` };
+    if (res.status === 200) {
+      lastEgressCheck = { at: Date.now(), ok: true, ms: Date.now() - t0, error: null };
+    } else if (res.status === 401) {
+      lastEgressCheck = { at: Date.now(), ok: false, ms: Date.now() - t0, error: 'HTTP 401 — token invalid or revoked!' };
+    } else if (res.status === 429) {
+      const retryAfterRaw = res.headers.get('retry-after');
+      const retryAfter = retryAfterRaw && Number.isFinite(parseFloat(retryAfterRaw))
+        ? Math.ceil(parseFloat(retryAfterRaw))
+        : null;
+      lastEgressCheck = {
+        at: Date.now(), ok: false, ms: Date.now() - t0,
+        error: `HTTP 429 — Discord rate-limiting this IP${retryAfter ? ` (retry in ${retryAfter}s)` : ''}`,
+      };
+    } else {
+      lastEgressCheck = { at: Date.now(), ok: false, ms: Date.now() - t0, error: `HTTP ${res.status}` };
+    }
   } catch (err) {
     lastEgressCheck = { at: Date.now(), ok: false, ms: Date.now() - t0, error: err.message };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -240,6 +261,8 @@ setInterval(async () => {
   await probeDiscordEgress();
   if (lastEgressCheck?.ok) {
     console.log(`🌐 Discord API reachable (${lastEgressCheck.ms}ms)`);
+  } else if (lastEgressCheck?.error?.includes('429')) {
+    console.error('🌐 Discord API RATE-LIMITED (429) — backing off, will retry automatically');
   } else {
     console.error(`🌐 Discord API UNREACHABLE: ${lastEgressCheck?.error}`);
   }
@@ -332,26 +355,36 @@ process.on('SIGTERM', () => {
 
 // ── Start ────────────────────────────────────────────────────────────
 const LOGIN_TIMEOUT_MS = 45_000; // how long to wait for one login attempt
-const RETRY_DELAY_MS   = 8_000;  // pause between attempts
+const RETRY_MIN_MS     = 15_000; // first retry delay
+const RETRY_MAX_MS     = 5 * 60_000; // backoff cap: never retry faster than every 5 min
+
+// Exponential backoff: 15s, 30s, 60s, 120s, 240s, 480s→capped at 5 min.
+// Rapid retries trigger Discord's rate limiter (HTTP 429); backing off lets the
+// limit expire and still self-heals the moment Discord responds again.
+function nextRetryDelay(attempt) {
+  return Math.min(RETRY_MIN_MS * 2 ** Math.min(attempt - 1, 5), RETRY_MAX_MS);
+}
 
 // Retry login in-process instead of crashing the container: Render keeps the
-// service running and healthy (200), the bot keeps trying every ~8s, and the
-// moment Discord is reachable it connects — no manual redeploys, no crash loops.
+// service running and healthy (200), the bot backs off exponentially, and the
+// moment Discord allows the connection it logs in — no manual redeploys, no
+// crash loops, no rate-limit hammering.
 async function attemptLogin() {
   loginAttempt += 1;
   const attempt = loginAttempt;
   let aborted = false;
-  console.log(`🔁 Login attempt #${attempt}...`);
+  const delaySec = nextRetryDelay(attempt) / 1000;
+  console.log(`🔁 Login attempt #${attempt}... (next retry in ${delaySec}s if this fails)`);
   lastLoginError = null;
 
   // If this attempt neither succeeds nor fails in time (e.g. the gateway TCP
   // handshake hangs), tear the client down and schedule a fresh attempt.
   loginWatchdog = setTimeout(() => {
     aborted = true;
-    console.error(`⏰ Attempt #${attempt} hung after ${LOGIN_TIMEOUT_MS / 1000}s — Discord gateway unreachable.`);
-    lastLoginError = 'Login timed out — Discord gateway unreachable';
+    console.error(`⏰ Attempt #${attempt} hung after ${LOGIN_TIMEOUT_MS / 1000}s — Discord not responding. Backing off — next try in ${delaySec}s.`);
+    lastLoginError = 'Login timed out — Discord gateway not responding (possibly rate-limited)';
     client.destroy().catch(() => {});
-    retryTimer = setTimeout(attemptLogin, RETRY_DELAY_MS);
+    retryTimer = setTimeout(attemptLogin, nextRetryDelay(attempt));
   }, LOGIN_TIMEOUT_MS);
 
   try {
@@ -371,9 +404,13 @@ async function attemptLogin() {
     clearTimeout(loginWatchdog);
     loginWatchdog = null;
     lastLoginError = err.message;
-    console.error(`❌ Attempt #${attempt} FAILED:`, err.message);
+    if (/429|rate.?limit/i.test(err.message || '')) {
+      console.error(`⏸️ Attempt #${attempt} RATE-LIMITED by Discord (429). Backing off — next try in ${delaySec}s.`);
+    } else {
+      console.error(`❌ Attempt #${attempt} FAILED:`, err.message);
+    }
     client.destroy().catch(() => {});
-    retryTimer = setTimeout(attemptLogin, RETRY_DELAY_MS);
+    retryTimer = setTimeout(attemptLogin, nextRetryDelay(attempt));
   }
 }
 
