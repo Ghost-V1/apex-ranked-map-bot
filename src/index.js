@@ -33,7 +33,10 @@ let lastKnownMapCode = null; // tracks the previously-seen ranked map code
 let lastKnownMapName = null; // tracks the previously-seen ranked map display name
 let lastLoginError = null;   // last Discord login error message, surfaced via health endpoint
 let pollTimer = null;
-let loginWatchdog = null;    // 60s timer: kills a hanging login so Render restarts us
+let loginWatchdog = null;    // per-attempt timeout: tears down a hanging login and retries
+let retryTimer = null;       // scheduled next attempt (cleared on success to avoid stale retries)
+let loginAttempt = 0;        // login retry counter (surfaced via health endpoint)
+let lastEgressCheck = null;  // cached Discord API reachability probe result
 const processStart = Date.now();
 
 // ── Map Emoji & Color Helpers ────────────────────────────────────────
@@ -189,8 +192,17 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 // ── Lifecycle ────────────────────────────────────────────────────────
-client.once('clientReady', () => {
-  clearTimeout(loginWatchdog);
+// .on() (not .once()) so a re-login after a connection failure still re-runs setup.
+client.on('clientReady', () => {
+  if (loginWatchdog) {
+    clearTimeout(loginWatchdog);
+    loginWatchdog = null;
+  }
+  if (pollTimer) {
+    // Already set up from a previous successful login — this is a reconnect.
+    console.log(`✅ Reconnected as ${client.user.tag}`);
+    return;
+  }
   console.log(`✅ Logged in as ${client.user.tag}`);
   console.log(`📍 Alert channel: ${process.env.CHANNEL_ID}`);
   console.log(`⏱️  Polling every ${POLL_INTERVAL_MS / 60_000} minutes`);
@@ -201,25 +213,61 @@ client.once('clientReady', () => {
   pollTimer = setInterval(checkAndAlert, POLL_INTERVAL_MS);
 });
 
+// ── Discord Reachability Probe ───────────────────────────────────────
+// Separately pings Discord's REST API so we can tell whether the instance can
+// reach Discord at all — independent of the gateway (ws) connection.
+async function probeDiscordEgress() {
+  const t0 = Date.now();
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    const res = await fetch('https://discord.com/api/v10/gateway', {
+      signal: controller.signal,
+      headers: { 'User-Agent': 'ApexRankedMapBot/1.0' },
+    });
+    clearTimeout(timer);
+    lastEgressCheck = res.ok
+      ? { at: Date.now(), ok: true, ms: Date.now() - t0, error: null }
+      : { at: Date.now(), ok: false, ms: Date.now() - t0, error: `HTTP ${res.status}` };
+  } catch (err) {
+    lastEgressCheck = { at: Date.now(), ok: false, ms: Date.now() - t0, error: err.message };
+  }
+}
+
+// Log reachability every minute so Render's Logs tab shows whether the instance
+// can reach Discord over time.
+setInterval(async () => {
+  await probeDiscordEgress();
+  if (lastEgressCheck?.ok) {
+    console.log(`🌐 Discord API reachable (${lastEgressCheck.ms}ms)`);
+  } else {
+    console.error(`🌐 Discord API UNREACHABLE: ${lastEgressCheck?.error}`);
+  }
+}, 60_000);
+
 // ── HTTP Server (for Render health checks & UptimeRobot keep-alive) ──
 // Try PORT env var first, fall back to a random available port if needed
 const PORT = process.env.PORT || 0;
 const server = http.createServer((req, res) => {
+  // Refresh the cached reachability probe if it's more than 30s old.
+  if (!lastEgressCheck || Date.now() - lastEgressCheck.at > 30_000) {
+    probeDiscordEgress();
+  }
   const ready = client.isReady();
   const body =
     `🟢 Apex Ranked Map Bot\n` +
     `Discord connected: ${ready ? 'YES ✅' : 'NO ❌'}\n` +
     `Current map: ${lastKnownMapName || 'loading...'}\n` +
-    (lastLoginError ? `Last login error: ${lastLoginError}\n` : '');
-  // Grace period of 45s after boot: during startup the bot is briefly not
-  // connected yet, so don't fail the health check until it's had time to log in.
-  const stillStarting = Date.now() - processStart < 45_000;
-  if (ready || stillStarting) {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-  } else {
-    // Fail Render's health check loudly instead of reporting "live" while dead
-    res.writeHead(503, { 'Content-Type': 'text/plain' });
-  }
+    (lastLoginError ? `Last login error: ${lastLoginError}\n` : '') +
+    `Discord API reachable: ${lastEgressCheck
+      ? (lastEgressCheck.ok ? `YES ✅ (${lastEgressCheck.ms}ms)` : `NO ❌ (${lastEgressCheck.error})`)
+      : 'checking...'}\n` +
+    `Uptime: ${Math.floor((Date.now() - processStart) / 1000)}s\n` +
+    `Login attempts: ${loginAttempt}\n`;
+  // Always answer 200 while the process is alive — the body reports the truth.
+  // (Returning 503 made Render mark deploys failed and show "Instance failed"
+  // events even though the process was simply waiting to connect.)
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end(body);
 });
 server.on('error', (err) => {
@@ -246,23 +294,50 @@ process.on('SIGTERM', () => {
 });
 
 // ── Start ────────────────────────────────────────────────────────────
-// Watchdog: if login neither succeeds nor fails within 60s (e.g. Discord's
-// gateway is unreachable from Render), fail loudly and let Render restart us.
-// Without this, a hanging login sits at 503 forever with no log line and no retry.
-loginWatchdog = setTimeout(() => {
-  console.error('⏰ Discord login is hanging (no response after 60s).');
-  console.error('   This usually means the bot cannot reach Discord from Render.');
-  console.error('   Exiting so Render restarts us — will retry automatically.');
-  process.exit(1);
-}, 60_000);
+const LOGIN_TIMEOUT_MS = 45_000; // how long to wait for one login attempt
+const RETRY_DELAY_MS   = 8_000;  // pause between attempts
 
-client.login(process.env.DISCORD_TOKEN).catch((err) => {
-  clearTimeout(loginWatchdog);
-  lastLoginError = err.message;
-  console.error('❌ Discord login FAILED:', err.message);
-  console.error('   This usually means DISCORD_TOKEN is wrong, expired, or has extra whitespace.');
-  console.error('   Fix it in Render → Environment → DISCORD_TOKEN, then redeploy.');
-  // Stay alive briefly so the health endpoint reports WHY (Discord connected: NO
-  // + last login error), then exit so Render's restart loop retries automatically.
-  setTimeout(() => process.exit(1), 45_000);
-});
+// Retry login in-process instead of crashing the container: Render keeps the
+// service running and healthy (200), the bot keeps trying every ~8s, and the
+// moment Discord is reachable it connects — no manual redeploys, no crash loops.
+async function attemptLogin() {
+  loginAttempt += 1;
+  const attempt = loginAttempt;
+  let aborted = false;
+  console.log(`🔁 Login attempt #${attempt}...`);
+  lastLoginError = null;
+
+  // If this attempt neither succeeds nor fails in time (e.g. the gateway TCP
+  // handshake hangs), tear the client down and schedule a fresh attempt.
+  loginWatchdog = setTimeout(() => {
+    aborted = true;
+    console.error(`⏰ Attempt #${attempt} hung after ${LOGIN_TIMEOUT_MS / 1000}s — Discord gateway unreachable.`);
+    lastLoginError = 'Login timed out — Discord gateway unreachable';
+    client.destroy().catch(() => {});
+    retryTimer = setTimeout(attemptLogin, RETRY_DELAY_MS);
+  }, LOGIN_TIMEOUT_MS);
+
+  try {
+    await client.login(process.env.DISCORD_TOKEN);
+    // Cancel any stale scheduled retry now that login settled, even if the
+    // watchdog fired first (destroy() normally forces a rejection, but be safe).
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+    if (aborted) return; // watchdog already took over
+    clearTimeout(loginWatchdog);
+    loginWatchdog = null;
+    // clientReady handler (client.on) performs the rest of setup
+  } catch (err) {
+    if (aborted) return; // watchdog already scheduled the next attempt
+    clearTimeout(loginWatchdog);
+    loginWatchdog = null;
+    lastLoginError = err.message;
+    console.error(`❌ Attempt #${attempt} FAILED:`, err.message);
+    client.destroy().catch(() => {});
+    retryTimer = setTimeout(attemptLogin, RETRY_DELAY_MS);
+  }
+}
+
+attemptLogin();
