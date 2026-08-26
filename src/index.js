@@ -315,7 +315,7 @@ const server = http.createServer((req, res) => {
   }
   const ready = client.isReady();
   const body =
-    `🟢 Apex Ranked Map Bot\n` +
+    `🟢 Apex Ranked Map Bot — Online\n` +
     `Discord connected: ${ready ? 'YES ✅' : 'NO ❌'}\n` +
     `Current map: ${lastKnownMapName || 'loading...'}\n` +
     (lastLoginError ? `Last login error: ${lastLoginError}\n` : '') +
