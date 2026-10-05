@@ -1,5 +1,6 @@
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const { getCurrentRankedMap, fetchMapRotation } = require('./map-checker');
+const { normalizeMapName, rotationState } = require('./rotation');
 const http = require('http');
 require('dotenv').config();
 
@@ -38,6 +39,8 @@ client.on('resume', () => {
 
 let lastKnownMapCode = null; // tracks the previously-seen ranked map code
 let lastKnownMapName = null; // tracks the previously-seen ranked map display name
+let lastRotationEnd = null;  // scheduled end timestamp of the last alerted rotation (rotation identity)
+let checkInFlight = false;   // re-entrancy guard so two polls can't race and double-send
 let lastLoginError = null;   // last Discord login error message, surfaced via health endpoint
 let pollTimer = null;
 let loginWatchdog = null;    // per-attempt timeout: tears down a hanging login and retries
@@ -84,51 +87,104 @@ function formatCountdown(ts) {
 }
 
 // ── Poll & Alert ─────────────────────────────────────────────────────
+// A rotation is identified by its scheduled END timestamp (falling back to the
+// display name when the site omits it). The end timestamp is stable for the
+// entire rotation, so cosmetic page jitter can't look like a new map.
+//
+// The rotation is committed to state BEFORE the message is sent, because
+// channel.send() is NOT idempotent: on a flaky connection Discord can post the
+// message while our request throws (Render's shared free-tier IP is routinely
+// rate-limited, HTTP 429). Recording state only after a successful send meant
+// such a failure re-fired the SAME alert on the next poll — every poll, hence
+// multiple alerts per rotation.
 async function checkAndAlert() {
-  const channel = client.channels.cache.get(process.env.CHANNEL_ID);
-  if (!channel) {
-    console.error('❌ Could not find the alert channel. Check CHANNEL_ID.');
+  if (checkInFlight) {
+    console.warn('⏭️ Skipping poll — previous check is still running.');
     return;
   }
+  checkInFlight = true;
 
   try {
-    const { currentMap, currentCode, nextMap, nextCode, currentEnd } =
-      await getCurrentRankedMap();
+    const channel = client.channels.cache.get(process.env.CHANNEL_ID);
+    if (!channel) {
+      console.error('❌ Could not find the alert channel. Check CHANNEL_ID.');
+      return;
+    }
 
+    const {
+      currentMap: rawMap, currentCode, nextMap, nextCode, currentEnd,
+    } = await getCurrentRankedMap();
+
+    // Normalize whitespace so cosmetic markup changes can't look like a new map.
+    const currentMap = normalizeMapName(rawMap);
     if (!currentMap) return; // nothing to report
 
-    // First run — just store, don't alert.
-    // Track by the raw map NAME, not the mapped code. The name is always a
-    // non-null string when we get here, so this sentinel can't collide with a
-    // missing/unrecognized value and silently stop the bot from alerting.
-    if (lastKnownMapName === null) {
+    const end = Number.isFinite(currentEnd) ? currentEnd : null;
+    const state = rotationState(
+      { lastRotationEnd, lastKnownMapName },
+      { end, map: currentMap },
+    );
+
+    // First successful observation in this process — baseline, don't alert.
+    if (state === 'baseline') {
+      lastRotationEnd = end;
       lastKnownMapCode = currentCode;
       lastKnownMapName = currentMap;
       console.log(`📍 Initial map: ${currentMap} (${currentCode})`);
       return;
     }
 
-    // Map changed!
-    if (currentMap !== lastKnownMapName) {
-      const embed = new EmbedBuilder()
-        .setTitle(`${mapEmoji(currentCode)} Ranked Map Changed!`)
-        .setDescription(
-          `The ranked map has rotated!\n\n` +
-          `**Previous:** ~~${lastKnownMapName}~~\n` +
-          `**Current:** **${currentMap}** ${mapEmoji(currentCode)}\n` +
-          `**Next up:** ${nextMap || 'Unknown'} ${mapEmoji(nextCode)}\n\n` +
-          `Current map ends ${formatCountdown(currentEnd)}`
-        )
-        .setColor(mapColor(currentCode))
-        .setTimestamp();
+    if (state === 'stale') {
+      // An older rotation than the one we already reported — almost certainly a
+      // cached/stale page. Never alert on it, and never overwrite our state.
+      console.warn(`⏭️ Ignoring stale rotation (end ${end} ≤ ${lastRotationEnd}) — likely a cached page.`);
+      return;
+    }
 
+    if (state === 'same') {
+      // Same rotation — never alert. In timestamp mode leave the recorded name
+      // alone so the next alert's "Previous" reflects the map you actually saw,
+      // not a mid-rotation relabel. In fallback (name) mode keep it in sync so a
+      // cosmetic spelling change can't re-trigger.
+      if (end === null || lastRotationEnd === null) {
+        lastKnownMapName = currentMap;
+        lastKnownMapCode = currentCode;
+      }
+      return;
+    }
+
+    // A genuinely new rotation — alert EXACTLY once. Commit the new rotation to
+    // state before sending so a failed/ambiguous send can't repeat next poll.
+    const previousName = lastKnownMapName;
+    lastRotationEnd = end !== null ? end : lastRotationEnd;
+    lastKnownMapCode = currentCode;
+    lastKnownMapName = currentMap;
+
+    const embed = new EmbedBuilder()
+      .setTitle(`${mapEmoji(currentCode)} Ranked Map Changed!`)
+      .setDescription(
+        `The ranked map has rotated!\n\n` +
+        `**Previous:** ~~${previousName}~~\n` +
+        `**Current:** **${currentMap}** ${mapEmoji(currentCode)}\n` +
+        `**Next up:** ${nextMap || 'Unknown'} ${mapEmoji(nextCode)}\n\n` +
+        `Current map ends ${formatCountdown(currentEnd)}`
+      )
+      .setColor(mapColor(currentCode))
+      .setTimestamp();
+
+    try {
       await channel.send({ embeds: [embed] });
-      console.log(`🔄 Map changed: ${lastKnownMapName} → ${currentMap}`);
-      lastKnownMapCode = currentCode;
-      lastKnownMapName = currentMap;
+      console.log(`🔄 Map changed: ${previousName} → ${currentMap} (rotation ends ${end ?? 'n/a'})`);
+    } catch (err) {
+      // State is already committed — deliberately do NOT re-alert. The message
+      // may even have been delivered; Discord's send is not idempotent, so a
+      // retry risks the exact duplicate we're eliminating.
+      console.error(`⚠️ Alert send failed for rotation ending ${end ?? 'n/a'}: ${err.message}`);
     }
   } catch (err) {
     console.error('⚠️ Polling error:', err.message);
+  } finally {
+    checkInFlight = false;
   }
 }
 
@@ -232,7 +288,12 @@ client.on('clientReady', () => {
 //   401  → token invalid/revoked (fix in Render env)
 //   429  → Discord rate-limiting this IP (back off and wait)
 //   error → network-level unreachability
+// Returns true if a probe actually ran, false if skipped inside a 429 backoff
+// window (so the caller doesn't log stale state as if it were fresh).
 async function probeDiscordEgress() {
+  // Respect a 429 Retry-After window instead of hammering Discord's API —
+  // continued requests can extend the rate limit and starve the real sends.
+  if (lastEgressCheck?.retryAt && Date.now() < lastEgressCheck.retryAt) return false;
   const t0 = Date.now();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 8000);
@@ -255,6 +316,7 @@ async function probeDiscordEgress() {
         : null;
       lastEgressCheck = {
         at: Date.now(), ok: false, ms: Date.now() - t0,
+        retryAt: retryAfter ? Date.now() + retryAfter * 1000 : null,
         error: `HTTP 429 — Discord rate-limiting this IP${retryAfter ? ` (retry in ${retryAfter}s)` : ''}`,
       };
     } else {
@@ -265,16 +327,18 @@ async function probeDiscordEgress() {
   } finally {
     clearTimeout(timer);
   }
+  return true;
 }
 
 // Log reachability every minute so Render's Logs tab shows whether the instance
 // can reach Discord over time.
 setInterval(async () => {
-  await probeDiscordEgress();
+  const ran = await probeDiscordEgress();
+  if (!ran) return; // inside a 429 backoff window — stay quiet, don't probe
   if (lastEgressCheck?.ok) {
     console.log(`🌐 Discord API reachable (${lastEgressCheck.ms}ms)`);
   } else if (lastEgressCheck?.error?.includes('429')) {
-    console.error('🌐 Discord API RATE-LIMITED (429) — backing off, will retry automatically');
+    console.error('🌐 Discord API RATE-LIMITED (429) — will not probe again until Retry-After elapses');
   } else {
     console.error(`🌐 Discord API UNREACHABLE: ${lastEgressCheck?.error}`);
   }
