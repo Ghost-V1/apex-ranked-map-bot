@@ -457,6 +457,7 @@ process.on('SIGTERM', () => {
 
 // ── Start ────────────────────────────────────────────────────────────
 const LOGIN_TIMEOUT_MS = 45_000; // how long to wait for one login attempt
+const READY_GRACE_MS   = 15_000; // after login resolves, how long to wait for isReady()
 const RETRY_MIN_MS     = 60_000; // first retry delay (1 min — deliberately gentle)
 const RETRY_MAX_MS     = 30 * 60_000; // backoff cap: never retry faster than every 30 min
 const RECONNECT_WATCH_MS = 60_000; // how often we verify the gateway is still up
@@ -531,6 +532,28 @@ function scheduleRetry(attempt, delayOverrideMs) {
   }, delay);
 }
 
+// login() resolves once the gateway handshake completes, but the READY dispatch
+// that flips isReady() to true can land a tick or two later. Give it a bounded
+// grace window so we never tear down a healthy session — a synchronous
+// isReady() check right after login() produced exactly that false negative and
+// left the bot offline even with a valid token.
+function waitForReady(timeoutMs) {
+  if (client.isReady()) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      client.off('clientReady', onReady);
+      clearTimeout(timer);
+      resolve(ok);
+    };
+    const onReady = () => finish(true);
+    const timer = setTimeout(() => finish(client.isReady()), timeoutMs);
+    client.once('clientReady', onReady);
+  });
+}
+
 // Retry login in-process instead of crashing the container: Render keeps the
 // service running and healthy (200), the bot backs off exponentially, and the
 // moment Discord allows the connection it logs in — no manual redeploys, no
@@ -579,6 +602,9 @@ async function attemptLogin() {
 
   try {
     await client.login(process.env.DISCORD_TOKEN);
+    if (aborted) return; // watchdog already took over and scheduled the retry
+    // Wait for the READY dispatch rather than checking isReady() immediately.
+    const ready = await waitForReady(READY_GRACE_MS);
     clearTimeout(loginWatchdog);
     loginWatchdog = null;
     // Check `aborted` BEFORE touching retryTimer: if the watchdog already took
@@ -586,9 +612,9 @@ async function attemptLogin() {
     // the bot permanently offline with no attempt pending — the exact stall that
     // produced "one login attempt, then nothing for hours".
     if (aborted) return;
-    if (!client.isReady()) {
-      // Login resolved but the gateway never became ready (rare). Treat it as a
-      // failure rather than sitting idle forever.
+    if (!ready) {
+      // Login resolved but the gateway never became ready. Treat it as a failure
+      // rather than sitting idle forever.
       lastLoginError = 'Login resolved but the gateway never became ready';
       client.destroy().catch(() => {});
       scheduleRetry(attempt);
