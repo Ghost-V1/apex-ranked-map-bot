@@ -3,6 +3,7 @@ const { getCurrentRankedMap, fetchMapRotation } = require('./map-checker');
 const { normalizeMapName, rotationState } = require('./rotation');
 const http = require('http');
 require('dotenv').config();
+const { loadState, saveState } = require('./state-store');
 
 // ── Config ───────────────────────────────────────────────────────────
 const POLL_INTERVAL_MS = 5 * 60 * 1000; // check every 5 minutes
@@ -37,15 +38,21 @@ client.on('resume', () => {
   console.warn('🔌 Discord gateway session resumed — polling resumed');
 });
 
+// The last rotation we reported survives process restarts via a small file, so
+// a rotation that happened while the bot was offline still alerts once on the
+// next successful poll instead of being silently re-baselined. See state-store.js.
+const persistedState = loadState();
 let lastKnownMapCode = null; // tracks the previously-seen ranked map code
-let lastKnownMapName = null; // tracks the previously-seen ranked map display name
-let lastRotationEnd = null;  // scheduled end timestamp of the last alerted rotation (rotation identity)
+let lastKnownMapName = persistedState.lastKnownMapName; // tracks the previously-seen ranked map display name
+let lastRotationEnd = persistedState.lastRotationEnd;   // scheduled end timestamp of the last alerted rotation (rotation identity)
 let checkInFlight = false;   // re-entrancy guard so two polls can't race and double-send
 let lastLoginError = null;   // last Discord login error message, surfaced via health endpoint
 let pollTimer = null;
 let loginWatchdog = null;    // per-attempt timeout: tears down a hanging login and retries
 let retryTimer = null;       // scheduled next attempt (cleared on success to avoid stale retries)
-let loginAttempt = 0;        // login retry counter (surfaced via health endpoint)
+let loginAttempt = 0;        // consecutive login retry counter (surfaced via health endpoint)
+let loginAttempts = [];      // timestamps of recent login attempts — rolling connection budget
+let readySinceTimer = null;  // clears the backoff counters only after a STABLE connection
 let lastEgressCheck = null;  // cached Discord API reachability probe result
 const processStart = Date.now();
 
@@ -130,6 +137,7 @@ async function checkAndAlert() {
       lastRotationEnd = end;
       lastKnownMapCode = currentCode;
       lastKnownMapName = currentMap;
+      saveState({ lastRotationEnd, lastKnownMapName });
       console.log(`📍 Initial map: ${currentMap} (${currentCode})`);
       return;
     }
@@ -149,6 +157,7 @@ async function checkAndAlert() {
       if (end === null || lastRotationEnd === null) {
         lastKnownMapName = currentMap;
         lastKnownMapCode = currentCode;
+        saveState({ lastRotationEnd, lastKnownMapName });
       }
       return;
     }
@@ -159,6 +168,9 @@ async function checkAndAlert() {
     lastRotationEnd = end !== null ? end : lastRotationEnd;
     lastKnownMapCode = currentCode;
     lastKnownMapName = currentMap;
+    // Persist BEFORE sending (same reasoning as the in-memory commit) so a crash
+    // mid-send can't replay this rotation on the next start.
+    saveState({ lastRotationEnd, lastKnownMapName });
 
     const embed = new EmbedBuilder()
       .setTitle(`${mapEmoji(currentCode)} Ranked Map Changed!`)
@@ -267,11 +279,24 @@ function ensurePolling() {
 
 // .on() (not .once()) so a re-login after a connection failure still re-runs setup.
 client.on('clientReady', () => {
-  loginAttempt = 0; // successful login — reset the backoff counter
   if (loginWatchdog) {
     clearTimeout(loginWatchdog);
     loginWatchdog = null;
   }
+  // Do NOT reset the backoff the instant we connect. A flapping link would
+  // reset it on every brief connect and then retry at the minimum delay each
+  // time — exactly how a reconnect storm builds up (Discord resets a bot's
+  // token at >1000 connections in a short window). Only a connection that
+  // holds for STABLE_RESET_MS counts as healthy and clears the counters.
+  if (readySinceTimer) clearTimeout(readySinceTimer);
+  readySinceTimer = setTimeout(() => {
+    readySinceTimer = null;
+    if (!client.isReady()) return;
+    if (loginAttempt !== 0) console.log('✅ Connection stable — resetting login backoff.');
+    loginAttempt = 0;
+    loginAttempts = [];
+  }, STABLE_RESET_MS);
+
   if (client.isReady() && !pollTimer) {
     console.log(`✅ Logged in as ${client.user.tag}`);
     console.log(`📍 Alert channel: ${process.env.CHANNEL_ID}`);
@@ -399,7 +424,8 @@ const server = http.createServer((req, res) => {
       ? (lastEgressCheck.ok ? `YES ✅ (${lastEgressCheck.ms}ms)` : `NO ❌ (${lastEgressCheck.error})`)
       : 'checking...'}\n` +
     `Uptime: ${Math.floor((Date.now() - processStart) / 1000)}s\n` +
-    `Login attempts: ${loginAttempt}\n`;
+    `Login attempts: ${loginAttempt}` +
+    ` (last hour: ${loginAttempts.filter((t) => t >= Date.now() - ATTEMPT_WINDOW_MS).length}/${MAX_ATTEMPTS_PER_WINDOW})\n`;
   // Always answer 200 while the process is alive — the body reports the truth.
   // (Returning 503 made Render mark deploys failed and show "Instance failed"
   // events even though the process was simply waiting to connect.)
@@ -431,68 +457,109 @@ process.on('SIGTERM', () => {
 
 // ── Start ────────────────────────────────────────────────────────────
 const LOGIN_TIMEOUT_MS = 45_000; // how long to wait for one login attempt
-const RETRY_MIN_MS     = 15_000; // first retry delay
-const RETRY_MAX_MS     = 5 * 60_000; // backoff cap: never retry faster than every 5 min
+const RETRY_MIN_MS     = 60_000; // first retry delay (1 min — deliberately gentle)
+const RETRY_MAX_MS     = 30 * 60_000; // backoff cap: never retry faster than every 30 min
 const RECONNECT_WATCH_MS = 60_000; // how often we verify the gateway is still up
+const STABLE_RESET_MS  = 5 * 60_000; // connection must hold this long before backoff resets
+// Hard ceiling on gateway connections per rolling hour. Discord resets a bot's
+// token when it sees excessive connections (>1000 in a short period). This
+// budget makes that structurally impossible, whatever bug or flapping link
+// triggered the retry loop in the first place.
+const ATTEMPT_WINDOW_MS = 60 * 60_000;
+const MAX_ATTEMPTS_PER_WINDOW = 20;
+// A rejected token can never be fixed by retrying — recognise it so we back off
+// at the maximum instead of hammering Discord with invalid logins.
+const INVALID_TOKEN_RE = /TokenInvalid|invalid token|401|unauthori[sz]ed/i;
 
-// Exponential backoff: 15s, 30s, 60s, 120s, 240s, 480s→capped at 5 min.
-// Rapid retries trigger Discord's rate limiter (HTTP 429); backing off lets the
-// limit expire and still self-heals the moment Discord responds again.
+// Exponential backoff: 60s, 2m, 4m, 8m, 16m, 32m→capped at 30 min.
+// Rapid retries trigger Discord's rate limiter (HTTP 429) and, at the extreme, a
+// token reset; backing off lets the limit expire and still self-heals the moment
+// Discord responds again.
 function nextRetryDelay(attempt) {
   return Math.min(RETRY_MIN_MS * 2 ** Math.min(attempt - 1, 5), RETRY_MAX_MS);
 }
 
-// ── Reconnect Watchdog ──────────────────────────────────────────────
-// The retry loop only runs until the FIRST successful login. If the gateway
-// drops AFTER that (Render's unstable free-tier IPs, a missed heartbeat, a
-// silent disconnect), nothing re-runs attemptLogin() and the process becomes an
-// orphan: Render says "live" (HTTP 200), but Discord shows the bot offline and
-// slash commands + rotation alerts stop working. This watchdog checks every
-// minute: if the client isn't ready but Discord's API is reachable, we tear
-// down the gateway and force a fresh login (which re-arms the poll loop via
-// clientReady). It's the difference between the bot being merely "running" and
-// actually connected.
-let reconnectWatch = null;
+// ── Liveness Supervisor ─────────────────────────────────────────────
+// The retry loop normally keeps the bot trying until it connects, and keeps it
+// alive across gateway drops. But a single unexpected path — a hung login whose
+// promise resolves instead of rejecting, an unexpected throw, etc. — can leave
+// the bot with NOTHING scheduled: Render reports "live" (HTTP 200) while Discord
+// shows the bot offline and rotation alerts silently stop (observed: one login
+// attempt, then no retries for hours). This supervisor runs every minute and,
+// ONLY when the client is not ready AND nothing is in flight AND no retry is
+// scheduled, schedules a normal backoff retry. Because every failure path
+// schedules a 60s–30min backoff retry and the connection budget caps attempts
+// per hour, the supervisor stays quiet during a normal outage or rate-limit
+// window and only steps in when the chain has genuinely broken — so it can
+// never hammer Discord.
+//
+// It deliberately preserves lastRotationEnd/lastKnownMapName so a rotation that
+// happened while we were down still alerts on the next poll.
+let supervisor = null;
 
-function startReconnectWatch() {
-  if (reconnectWatch) return;
-  reconnectWatch = setInterval(() => {
+function startSupervisor() {
+  if (supervisor) return;
+  supervisor = setInterval(() => {
     if (client.isReady()) return; // all good
-    if (loginWatchdog) return;    // a login attempt is currently in flight
-    if (retryTimer) return;       // a retry is already scheduled — stand aside
-    // Only force a reconnect if the network to Discord is actually fine —
-    // otherwise we're just hammering into an outage / rate limit.
-    const reachable = lastEgressCheck?.ok && (Date.now() - lastEgressCheck.at < 120_000);
-    if (!reachable) return;
-    console.error('🩺 Watchdog: Discord connected = NO but API reachable — forcing reconnect...');
-    // Deliberately KEEP lastKnownMapName so the first poll after reconnect
-    // compares the live map vs the pre-outage map and alerts if a rotation
-    // actually happened while we were down — otherwise that rotation is lost
-    // forever (the exact alert the user is missing). Only a brand-new process
-    // (lastKnownMapName === null) re-baselines silently.
-    const wasConnected = lastKnownMapName !== null;
-    client.destroy().catch(() => {});
-    lastLoginError = null;
-    loginAttempt = 0;
-    // Give discord.js a beat to fully tear down the old gateway before we
-    // open a fresh login — calling login() back-to-back with destroy() can
-    // race and leave the client in an inconsistent, never-ready state.
-    setTimeout(() => {
-      attemptLogin().catch((e) => console.error('🩺 Reconnect attempt failed:', e.message));
-    }, 2000);
-    if (wasConnected) {
-      console.warn('🩺 Will alert on next poll if the map rotated while offline.');
-    }
+    if (loginWatchdog) return;    // a login attempt is in flight
+    if (retryTimer) return;       // an attempt is already scheduled
+    // Nothing in flight and nothing scheduled — the retry chain genuinely broke.
+    // Schedule a NORMAL backoff retry (which honours the connection budget and
+    // the exponential delay) instead of force-destroying the client and logging
+    // straight back in. The old eager reconnect was itself a connection-storm
+    // source: it bypassed the backoff and could run every 60s indefinitely.
+    console.warn('🩺 Supervisor: disconnected with no attempt scheduled — scheduling a retry.');
+    scheduleRetry(loginAttempt);
   }, RECONNECT_WATCH_MS);
 }
 
-startReconnectWatch();
+startSupervisor();
+
+// Schedule the next login attempt with exponential backoff. Never stacks two
+// retries, so the supervisor can rely on `retryTimer` meaning "one is pending".
+// `delayOverrideMs` lets a caller (e.g. the connection budget, or an invalid
+// token) wait longer than the computed backoff.
+function scheduleRetry(attempt, delayOverrideMs) {
+  if (retryTimer) return;
+  const delay = Number.isFinite(delayOverrideMs) ? delayOverrideMs : nextRetryDelay(attempt);
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    attemptLogin().catch((err) => {
+      console.error('❌ Scheduled retry threw:', err.message);
+      scheduleRetry(attempt);
+    });
+  }, delay);
+}
 
 // Retry login in-process instead of crashing the container: Render keeps the
 // service running and healthy (200), the bot backs off exponentially, and the
 // moment Discord allows the connection it logs in — no manual redeploys, no
 // crash loops, no rate-limit hammering.
 async function attemptLogin() {
+  // A fresh attempt supersedes any previously-scheduled retry.
+  if (retryTimer) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+
+  // ── Connection budget ──────────────────────────────────────────────
+  // Absolute ceiling on gateway connections per rolling hour. Even if some bug
+  // or a flapping link makes us retry continuously, we can never approach the
+  // >1000-connections-in-a-short-window that got the token reset. Once the
+  // budget is spent we wait for the oldest attempt to age out, then resume.
+  const windowCutoff = Date.now() - ATTEMPT_WINDOW_MS;
+  loginAttempts = loginAttempts.filter((t) => t >= windowCutoff);
+  if (loginAttempts.length >= MAX_ATTEMPTS_PER_WINDOW) {
+    const oldest = loginAttempts[0];
+    const waitMs = Math.max(RETRY_MIN_MS, oldest + ATTEMPT_WINDOW_MS - Date.now() + 5_000);
+    const waitSec = Math.ceil(waitMs / 1000);
+    console.error(`🛑 Connection budget reached (${MAX_ATTEMPTS_PER_WINDOW}/hour) — pausing ${waitSec}s so we never trigger a Discord token reset.`);
+    lastLoginError = `Connection budget reached — paused ${waitSec}s`;
+    scheduleRetry(loginAttempt, waitMs);
+    return;
+  }
+
+  loginAttempts.push(Date.now());
   loginAttempt += 1;
   const attempt = loginAttempt;
   let aborted = false;
@@ -507,33 +574,55 @@ async function attemptLogin() {
     console.error(`⏰ Attempt #${attempt} hung after ${LOGIN_TIMEOUT_MS / 1000}s — Discord not responding. Backing off — next try in ${delaySec}s.`);
     lastLoginError = 'Login timed out — Discord gateway not responding (possibly rate-limited)';
     client.destroy().catch(() => {});
-    retryTimer = setTimeout(attemptLogin, nextRetryDelay(attempt));
+    scheduleRetry(attempt);
   }, LOGIN_TIMEOUT_MS);
 
   try {
     await client.login(process.env.DISCORD_TOKEN);
-    // Cancel any stale scheduled retry now that login settled, even if the
-    // watchdog fired first (destroy() normally forces a rejection, but be safe).
+    clearTimeout(loginWatchdog);
+    loginWatchdog = null;
+    // Check `aborted` BEFORE touching retryTimer: if the watchdog already took
+    // over, ITS scheduled retry is the live one. Clearing it here could leave
+    // the bot permanently offline with no attempt pending — the exact stall that
+    // produced "one login attempt, then nothing for hours".
+    if (aborted) return;
+    if (!client.isReady()) {
+      // Login resolved but the gateway never became ready (rare). Treat it as a
+      // failure rather than sitting idle forever.
+      lastLoginError = 'Login resolved but the gateway never became ready';
+      client.destroy().catch(() => {});
+      scheduleRetry(attempt);
+      return;
+    }
+    // Genuinely connected — drop any stale scheduled retry.
     if (retryTimer) {
       clearTimeout(retryTimer);
       retryTimer = null;
     }
-    if (aborted) return; // watchdog already took over
-    clearTimeout(loginWatchdog);
-    loginWatchdog = null;
     // clientReady handler (client.on) performs the rest of setup
   } catch (err) {
     if (aborted) return; // watchdog already scheduled the next attempt
     clearTimeout(loginWatchdog);
     loginWatchdog = null;
     lastLoginError = err.message;
-    if (/429|rate.?limit/i.test(err.message || '')) {
-      console.error(`⏸️ Attempt #${attempt} RATE-LIMITED by Discord (429). Backing off — next try in ${delaySec}s.`);
-    } else {
-      console.error(`❌ Attempt #${attempt} FAILED:`, err.message);
-    }
+    const msg = err.message || '';
     client.destroy().catch(() => {});
-    retryTimer = setTimeout(attemptLogin, nextRetryDelay(attempt));
+    if (INVALID_TOKEN_RE.test(msg)) {
+      // The token itself is wrong or was revoked — retrying cannot help, and
+      // hammering Discord with invalid logins is exactly what got the token
+      // reset. Wait at the maximum backoff and say precisely what to do.
+      const waitSec = Math.round(RETRY_MAX_MS / 1000);
+      console.error(`🔑 Attempt #${attempt} rejected — DISCORD_TOKEN is invalid or was reset.`);
+      console.error('   Fix: get a new token at https://discord.com/developers/applications');
+      console.error(`   then update DISCORD_TOKEN and redeploy. Next try in ${waitSec}s.`);
+      scheduleRetry(attempt, RETRY_MAX_MS);
+    } else if (/429|rate.?limit/i.test(msg)) {
+      console.error(`⏸️ Attempt #${attempt} RATE-LIMITED by Discord (429). Backing off — next try in ${delaySec}s.`);
+      scheduleRetry(attempt);
+    } else {
+      console.error(`❌ Attempt #${attempt} FAILED:`, msg);
+      scheduleRetry(attempt);
+    }
   }
 }
 

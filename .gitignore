@@ -1,3 +1,4 @@
 node_modules/
 .env
 .freebuff/
+.bot-state.json
